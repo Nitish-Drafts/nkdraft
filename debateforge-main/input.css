@@ -1,0 +1,15 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer components {
+  .btn-smooth {
+    @apply rounded-lg shadow-soft transition-smooth hover:shadow-lg transform hover:-translate-y-0.5;
+  }
+  .card-smooth {
+    @apply bg-white rounded-xl shadow-soft p-4 border border-gray-200 transition-smooth hover:shadow-md;
+  }
+  .input-smooth {
+    @apply border-gray-300 rounded-lg focus:ring-2 focus:ring-soft-blue focus:border-soft-blue transition-smooth;
+  }
+}

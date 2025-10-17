@@ -1,0 +1,444 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>DebateForge</title>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <script src="https://unpkg.com/peerjs@1.5.2/dist/peerjs.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.5/socket.io.min.js"></script>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body class="bg-warm-gray">
+  <div id="root"></div>
+
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+    const API_BASE = "https://debateforge.onrender.com";
+
+    // ======== Helpers ========
+    function countWords(str) {
+      return str && str.trim().split(/\s+/).filter(Boolean).length || 0;
+    }
+
+    // ======== CommentThread ========
+    function CommentThread({ topic, addComment, startDebateFromComment }) {
+      const [text, setText] = useState('');
+      return (
+        <div>
+          <form onSubmit={(e) => { e.preventDefault(); addComment(topic._id, text); setText(''); }}>
+            <input value={text} onChange={e => setText(e.target.value)} placeholder="Add to forum..." className="input-smooth w-full p-2" />
+            <div className="mt-2">
+              <button className="btn-smooth bg-soft-blue text-white p-2">Comment</button>
+            </div>
+          </form>
+          <ul className="mt-2">
+            {(topic.comments || []).filter(c => !c.parentId).map(c => (
+              <li key={c._id} className="border-b py-1">
+                <div><strong>{c.author}</strong>: {c.text}</div>
+                <div className="mt-1">
+                  <button className="btn-smooth bg-gray-300 p-1 text-xs mr-2"
+                    onClick={() => {
+                      const reply = prompt('Reply:');
+                      if (reply) addComment(topic._id, reply, c._id);
+                    }}>Reply</button>
+                  <button className="btn-smooth bg-soft-yellow p-1 text-xs" onClick={() => startDebateFromComment(topic._id, c._id)}>Start Debate</button>
+                </div>
+                <ul className="ml-4 mt-2">
+                  {(topic.comments || []).filter(ch => ch.parentId === c._id).map(child => (
+                    <li key={child._id} className="text-sm italic">{child.author}: {child.text}</li>
+                  ))}
+                </ul>
+              </li>
+            ))}
+          </ul>
+        </div>
+      );
+    }
+
+    // ======== PollWidget ========
+    function PollWidget({ topic, currentUser }) {
+      const votedInitial = topic.postDebatePoll && topic.postDebatePoll.voters && topic.postDebatePoll.voters.includes(currentUser);
+      const [voted, setVoted] = useState(votedInitial);
+
+      const submitVote = async (choice) => {
+        if (!currentUser) return alert('Login to vote');
+        try {
+          const res = await fetch(API_BASE + '/topics/' + topic._id + '/poll', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ user: currentUser, vote: choice })
+          });
+          const data = await res.json();
+          if (data.error) alert(data.error);
+          else { setVoted(true); alert('Voted'); }
+        } catch (err) { console.error(err); }
+      };
+
+      return (
+        <div className="mt-2">
+          {voted ? <div className="text-white">Thanks for voting</div> : (
+            <div>
+              <button className="btn-smooth bg-soft-blue p-2 mr-2" onClick={() => submitVote('pro')}>Pro</button>
+              <button className="btn-smooth bg-soft-yellow p-2 mr-2" onClick={() => submitVote('con')}>Con</button>
+              <button className="btn-smooth bg-gray-600 p-2" onClick={() => submitVote('tie')}>Tie</button>
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    // ======== DebateRoom ========
+    function DebateRoom({ roomId, user, userRole, creatorStance, setInDebate }) {
+      const videoRef = useRef(null);
+      const peerRef = useRef(null);
+      const socketRef = useRef(null);
+      const [peers, setPeers] = useState({});
+      const [chat, setChat] = useState([]);
+      const [message, setMessage] = useState('');
+      const [qa, setQa] = useState([]);
+      const [qaInput, setQaInput] = useState('');
+      const [mutedUsers, setMutedUsers] = useState(new Set());
+      const localStreamRef = useRef(null);
+
+      useEffect(() => {
+        socketRef.current = io(API_BASE, { query: { userId: user.email } });
+        socketRef.current.emit('join-room', roomId, user.email, userRole);
+
+        socketRef.current.on('chat-message', (msg) => setChat(prev => prev.concat([msg])));
+        socketRef.current.on('qa-message', (m) => setQa(prev => prev.concat([m])));
+        socketRef.current.on('mute-user', (targetUser) => setMutedUsers(prev => new Set(prev).add(targetUser)));
+        socketRef.current.on('unmute-user', (targetUser) => {
+          const s = new Set(mutedUsers);
+          s.delete(targetUser);
+          setMutedUsers(s);
+        });
+
+        if (userRole !== 'viewer') {
+          peerRef.current = new Peer();
+          peerRef.current.on('open', (id) => { socketRef.current.emit('peer-id', roomId, id, user.email, userRole); });
+
+          navigator.mediaDevices.getUserMedia({ video: true, audio: true }).then(stream => {
+            localStreamRef.current = stream;
+            if (videoRef.current) { videoRef.current.srcObject = stream; videoRef.current.play(); }
+
+            socketRef.current.on('peer-id', ({ peerId, userId, role }) => {
+              try {
+                const call = peerRef.current.call(peerId, stream, { metadata: { userId: user.email, role: userRole } });
+                call.on('stream', remoteStream => {
+                  const p = {};
+                  Object.assign(p, peers);
+                  p[userId] = { stream: remoteStream, role: role };
+                  setPeers(p);
+                });
+              } catch (err) { console.error('Peer call error', err); }
+            });
+          }).catch(err => { console.error(err); alert('Camera/mic access required'); });
+
+          peerRef.current.on('call', call => {
+            navigator.mediaDevices.getUserMedia({ video: true, audio: true }).then(stream => {
+              call.answer(stream);
+              call.on('stream', remoteStream => {
+                const remoteId = call.metadata && call.metadata.userId ? call.metadata.userId : call.peer;
+                const role = call.metadata && call.metadata.role ? call.metadata.role : 'unknown';
+                const p = {};
+                Object.assign(p, peers);
+                p[remoteId] = { stream: remoteStream, role: role };
+                setPeers(p);
+              });
+            }).catch(err => console.error('answer error', err));
+          });
+        }
+
+        return () => {
+          if (peerRef.current) try { peerRef.current.destroy(); } catch(e) {}
+          if (socketRef.current) socketRef.current.disconnect();
+          if (localStreamRef.current) localStreamRef.current.getTracks().forEach(t => t.stop());
+        };
+      }, []);
+
+      const sendMessage = (e) => { e.preventDefault(); if (!message) return; socketRef.current.emit('chat-message', roomId, { user: user.email, role: userRole, text: message }); setMessage(''); };
+      const sendQa = (e) => { e.preventDefault(); if (!qaInput) return; socketRef.current.emit('qa-message', roomId, { id: Math.random().toString(36).slice(2), user: user.email, role: userRole, text: qaInput, approved: false }); setQaInput(''); };
+      const muteUser = (targetUser) => socketRef.current.emit('mute-user', { roomId, targetUser });
+      const unmuteUser = (targetUser) => socketRef.current.emit('unmute-user', { roomId, targetUser });
+      const leaveRoom = () => { if (localStreamRef.current) localStreamRef.current.getTracks().forEach(t => t.stop()); setInDebate(false); };
+
+      return (
+        <div className="container mx-auto p-4">
+          <h1 className="text-2xl font-bold mb-4 text-soft-blue">Debate Room: {roomId} — {user.email} ({userRole})</h1>
+          <button onClick={leaveRoom} className="btn-smooth bg-calm-red text-white p-2 mb-4">Leave Debate</button>
+
+          <div className="grid grid-cols-3 gap-4 mb-4">
+            {userRole !== 'viewer' && <div className="card-smooth"><small className="text-gray-600">You</small><video ref={videoRef} className="w-full rounded-lg" autoPlay muted playsInline /></div>}
+            {Object.keys(peers).map(email => {
+              const info = peers[email];
+              return (
+                <div key={email} className="card-smooth">
+                  <small className="text-gray-600">{email} ({info.role})</small>
+                  <video className="w-full rounded-lg" ref={el => el && (el.srcObject = info.stream)} autoPlay playsInline />
+                  {userRole === 'mediator' && <div className="mt-2"><button className="btn-smooth bg-calm-red text-white p-1 mr-1" onClick={() => muteUser(email)}>Mute</button><button className="btn-smooth bg-soft-blue text-white p-1" onClick={() => unmuteUser(email)}>Unmute</button></div>}
+                  {mutedUsers.has(email) && <div className="text-sm text-red-600 mt-1">Muted by mediator</div>}
+                </div>
+              );
+            })}
+          </div>
+
+          <div className="mt-4 card-smooth">
+            <h2 className="text-xl mb-2">Chat</h2>
+            <div className="border h-40 overflow-y-auto p-2 mb-2">
+              {chat.map((m, i) => <p key={i}><strong>{m.user} ({m.role}):</strong> {m.text}</p>)}
+            </div>
+            <form onSubmit={sendMessage} className="flex">
+              <input value={message} onChange={e => setMessage(e.target.value)} className="input-smooth flex-1 mr-2" placeholder="Message..." />
+              <button className="btn-smooth bg-soft-blue text-white p-2">Send</button>
+            </form>
+          </div>
+
+          <div className="mt-4 card-smooth">
+            <h2 className="text-xl mb-2 text-mint-green">Q&A</h2>
+            <div className="border h-40 overflow-y-auto p-2 mb-2">
+              {qa.map((q, i) => <p key={i}><strong>{q.user} ({q.role}):</strong> {q.text} {q.approved && <span className="text-green-600">(approved)</span>}</p>)}
+            </div>
+            <form onSubmit={sendQa} className="flex">
+              <input value={qaInput} onChange={e => setQaInput(e.target.value)} className="input-smooth flex-1 mr-2" placeholder="Ask question..." />
+              <button className="btn-smooth bg-mint-green text-white p-2">Submit Q&A</button>
+            </form>
+            {userRole === 'mediator' && <div className="mt-2"><small>Mediator tools: approve Q&A / mute users in participant cards.</small></div>}
+          </div>
+        </div>
+      );
+    }
+
+    // ======== App Component ========
+    function App() {
+      const [user, setUser] = useState(null);
+      const [topics, setTopics] = useState([]);
+      const [topic, setTopic] = useState('');
+      const [description, setDescription] = useState('');
+      const [category, setCategory] = useState('General');
+      const [scheduledFor, setScheduledFor] = useState('');
+      const [creatorStance, setCreatorStance] = useState('pro');
+      const [loading, setLoading] = useState(false);
+      const socketRef = useRef(null);
+      const [filterCategory, setFilterCategory] = useState('all');
+      const [inDebate, setInDebate] = useState(false);
+      const [roomId, setRoomId] = useState(null);
+      const [userRole, setUserRole] = useState(null);
+      const [creatorStanceForRoom, setCreatorStanceForRoom] = useState(null);
+
+      useEffect(() => {
+        const fetchTopics = () => {
+          setLoading(true);
+          const q = filterCategory === 'all' ? '' : `?category=${encodeURIComponent(filterCategory)}`;
+          fetch(`${API_BASE}/topics${q}`)
+            .then(r => r.json())
+            .then(data => setTopics(data || []))
+            .catch(err => console.error(err))
+            .finally(() => setLoading(false));
+        };
+        fetchTopics();
+        const t = setInterval(fetchTopics, 5000);
+        if (user) {
+          socketRef.current = io(API_BASE, { query: { userId: user.email } });
+          socketRef.current.on('refresh-topics', fetchTopics);
+        }
+        return () => { clearInterval(t); if (socketRef.current) socketRef.current.disconnect(); };
+      }, [user, filterCategory]);
+
+      const handleAuth = async (e, endpoint) => {
+        e.preventDefault();
+        const email = e.target.email.value;
+        const password = e.target.password.value;
+        setLoading(true);
+        try {
+          const res = await fetch(`${API_BASE}/${endpoint}`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ email, password })
+          });
+          const data = await res.json();
+          if (data.user) setUser(data.user);
+          else alert(data.error || 'Auth error');
+        } catch (err) { console.error(err); alert('Network error'); }
+        finally { setLoading(false); }
+      };
+
+      const postTopic = async (e) => {
+        e.preventDefault();
+        if (!user) return alert('Please log in');
+        if (topic.length < 5) return alert('Topic title too short');
+        if (countWords(description) < 50) return alert('Description must be at least 50 words');
+        setLoading(true);
+        try {
+          const body = { title: topic, description, category, stance: creatorStance, creator: user.email, scheduledFor: scheduledFor || null };
+          const res = await fetch(`${API_BASE}/topics`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+          const data = await res.json();
+          if (data.error) alert(data.error);
+          else { setTopic(''); setDescription(''); setCategory('General'); setScheduledFor(''); setTopics(prev => [data, ...prev]); }
+        } catch (err) { console.error(err); alert('Network error'); }
+        finally { setLoading(false); }
+      };
+
+      const joinDebate = async (topicId, role, userStance = null) => {
+        if (!user) return alert('Please log in');
+        setLoading(true);
+        try {
+          const res = await fetch(`${API_BASE}/topics/${topicId}/join`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ user: user.email, role, userStance })
+          });
+          const data = await res.json();
+          if (data.error) alert(data.error);
+          else { setRoomId(data.roomId); setUserRole(role); setCreatorStanceForRoom(data.creatorStance); setInDebate(true); }
+        } catch (err) { console.error(err); alert('Network error'); }
+        finally { setLoading(false); }
+      };
+
+      const deleteTopic = async (id) => {
+        if (!confirm('Delete this topic?')) return;
+        setLoading(true);
+        try {
+          const res = await fetch(`${API_BASE}/topics/${id}`, { method: 'DELETE', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ user: user.email }) });
+          const data = await res.json();
+          if (data.success) setTopics(prev => prev.filter(t => t._id !== id));
+          else alert(data.error || 'Error');
+        } catch (err) { console.error(err); }
+        finally { setLoading(false); }
+      };
+
+      const addComment = async (topicId, text, parentId = null) => {
+        if (!user) return alert('Login to comment');
+        if (!text || !text.trim()) return;
+        try {
+          const res = await fetch(`${API_BASE}/topics/${topicId}/comment`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ user: user.email, text, parentId }) });
+          const data = await res.json();
+          if (data.success) { const fresh = await (await fetch(`${API_BASE}/topics`)).json(); setTopics(fresh); }
+          else alert('Error posting comment');
+        } catch (err) { console.error(err); }
+      };
+
+      const startDebateFromComment = async (topicId, commentId) => {
+        if (!user) return alert('Login to start debate');
+        try {
+          const res = await fetch(`${API_BASE}/topics/${topicId}/start-debate`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ user: user.email, parentCommentId: commentId }) });
+          const data = await res.json();
+          if (data.error) alert(data.error);
+          else { setTopics(prev => [data, ...prev]); alert('New debate created from comment'); }
+        } catch (err) { console.error(err); }
+      };
+
+      if (inDebate) return <DebateRoom roomId={roomId} user={user} userRole={userRole} creatorStance={creatorStanceForRoom} setInDebate={setInDebate} />;
+
+      return (
+        <div className="container mx-auto p-4">
+          <h1 className="text-3xl font-bold mb-4 text-soft-blue">DebateForge</h1>
+          {!user ? (
+            <div className="mb-8 card-smooth">
+              <h2 className="text-xl mb-2">Login / Register</h2>
+              <form onSubmit={(e) => handleAuth(e, 'login')} className="mb-4">
+                <input name="email" type="email" placeholder="Email" className="input-smooth mr-2" required />
+                <input name="password" type="password" placeholder="Password" className="input-smooth mr-2" required />
+                <button className="btn-smooth bg-soft-blue text-white p-2">Login</button>
+              </form>
+              <form onSubmit={(e) => handleAuth(e, 'register')}>
+                <input name="email" type="email" placeholder="Email" className="input-smooth mr-2" required />
+                <input name="password" type="password" placeholder="Password" className="input-smooth mr-2" required />
+                <button className="btn-smooth bg-mint-green text-white p-2">Register</button>
+              </form>
+            </div>
+          ) : (
+            <div>
+              <p className="mb-4">Welcome {user.email} | <button onClick={() => setUser(null)} className="text-calm-red">Logout</button></p>
+
+              <form onSubmit={postTopic} className="mb-6 card-smooth">
+                <input value={topic} onChange={e => setTopic(e.target.value)} placeholder="Debate Topic" className="input-smooth w-full mb-2" required />
+                <textarea value={description} onChange={e => setDescription(e.target.value)} placeholder="Description (min 50 words)" className="input-smooth w-full mb-2" required />
+                <select value={category} onChange={e => setCategory(e.target.value)} className="input-smooth w-full mb-2">
+                  <option>General</option>
+                  <option>Politics</option>
+                  <option>Tech</option>
+                  <option>Science</option>
+                </select>
+                <input type="datetime-local" value={scheduledFor} onChange={e => setScheduledFor(e.target.value)} className="input-smooth w-full mb-2" />
+                <select value={creatorStance} onChange={e => setCreatorStance(e.target.value)} className="input-smooth w-full mb-2">
+                  <option value="pro">Pro</option>
+                  <option value="con">Con</option>
+                </select>
+                <button className="btn-smooth bg-soft-blue text-white p-2 w-full">Post Topic</button>
+              </form>
+
+              <div className="mb-4">
+                <label>Filter by category: </label>
+                <select value={filterCategory} onChange={e => setFilterCategory(e.target.value)} className="input-smooth ml-2">
+                  <option value="all">All</option>
+                  <option value="General">General</option>
+                  <option value="Politics">Politics</option>
+                  <option value="Tech">Tech</option>
+                  <option value="Science">Science</option>
+                </select>
+              </div>
+
+              <h2 className="text-xl mb-2">Open Debates</h2>
+              <ul>
+                {topics.map(t => (
+                  <li key={t._id} className="card-smooth mb-3">
+                    <div className="flex justify-between">
+                      <div>
+                        <p className="font-bold">{t.title} <small className="text-gray-600">({t.category})</small></p>
+                        <p className="text-gray-700">Creator stance: {t.creatorStance?.toUpperCase() || 'Unknown'} by {t.creator}</p>
+                        <p className="text-sm text-gray-600">{t.scheduledFor ? `Scheduled for ${new Date(t.scheduledFor).toLocaleString()}` : 'No schedule'}</p>
+                      </div>
+                      <div>
+                        {user.email === t.creator ? (
+                          <>
+                            <button onClick={() => joinDebate(t._id, 'creator')} className="btn-smooth bg-soft-blue text-white p-2 mr-2" disabled={t.scheduledFor && new Date() < new Date(t.scheduledFor)}>Enter as Creator</button>
+                            <button onClick={() => deleteTopic(t._id)} className="btn-smooth bg-calm-red text-white p-2">Delete</button>
+                          </>
+                        ) : (
+                          <>
+                            <div className="mb-1">
+                              <button className="btn-smooth bg-soft-yellow text-white p-2 mr-2"
+                                onClick={() => joinDebate(t._id, 'opponent', t.creatorStance === 'pro' ? 'con' : 'pro')}
+                                disabled={t.opponents?.filter(o => o.side === (t.creatorStance === 'pro' ? 'con' : 'pro')).length >= 3 || (t.scheduledFor && new Date() < new Date(t.scheduledFor))}>
+                                {t.opponents?.filter(o => o.side === (t.creatorStance === 'pro' ? 'con' : 'pro')).length >= 3 ? 'Team Full' : `Join ${t.creatorStance === 'pro' ? 'Con' : 'Pro'} Team`}
+                              </button>
+                              <button className="btn-smooth bg-pastel-purple text-white p-2 mr-2" onClick={() => joinDebate(t._id, 'mediator')} disabled={t.mediator}> {t.mediator ? 'Mediator Joined' : 'Join as Mediator'}</button>
+                              <button className="btn-smooth bg-gray-500 text-white p-2" onClick={() => joinDebate(t._id, 'viewer')}>Join as Viewer</button>
+                            </div>
+                          </>
+                        )}
+                        <div className="text-sm mt-1">
+                          <div>Pro team: {1 + (t.opponents?.filter(o => o.side === 'pro').length || 0)}</div>
+                          <div>Con team: {t.opponents?.filter(o => o.side === 'con').length || 0}</div>
+                        </div>
+                      </div>
+                    </div>
+
+                    <div className="mt-3 p-2 bg-gray-50 rounded-lg">
+                      <h3 className="text-md font-bold">Forum</h3>
+                      <CommentThread topic={t} addComment={addComment} startDebateFromComment={startDebateFromComment} />
+                    </div>
+
+                    {t.endedAt && (
+                      <div className="mt-2 p-2 bg-mint-green rounded">
+                        <p className="text-white">Debate ended. Poll: Pro {t.postDebatePoll?.pro || 0} - Con {t.postDebatePoll?.con || 0} - Tie {t.postDebatePoll?.tie || 0}</p>
+                        <PollWidget topic={t} currentUser={user?.email} />
+                      </div>
+                    )}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App />);
+  </script>
+</body>
+</html>
